@@ -1,15 +1,21 @@
 #!/bin/bash
 
-# currently: from setup ifb to dump pcaps
-
+# this scripts takes qdisc for router as argument
+QDISC="$@"
+# if qdisc null, set as fq_codel
+if [ -z "$QDISC" ]; then
+    QDISC="fq_codel"
+fi
+echo "qdisc: $QDISC"
 SND_VM=fyp-1
 RCV_VM=fyp-3
+ROUT_VM=debian12
 TIME=$(date +%Y%m%d-%H%M%S)
 
 # -- helper functions because I'm losing sanity over qemu-agent
 # takes two args: vm name and command, then returns pid
 vm_exec() {
-    # don't add any echo, it will break the return value (parsed by vm_exec_output)
+    # *** DO NOT ADD ANY EXTRA ECHO ***
     local vm=$1
     local cmd=$2
     
@@ -105,41 +111,48 @@ setup_ifb() {
     vm_exec_get $RCV_VM "tc filter replace dev $RIFN parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0"
 }
 
+setup_router() {
+    vm_exec_get $ROUT_VM "tc qdisc replace dev veth1 root $QDISC"
+    vm_exec_get $ROUT_VM "tc qdisc replace dev vwlan3 root $QDISC"
+}
+
 # takes bandwidth and RTT,
 # Please supply your units (e.g. mbps, ms) as needed by `tc`.
 tune() {
     local bw=$1
     local rtt=$2
+    echo "bw=$bw, rtt=$rtt"
     # calculate RTT/2
     local rtt_num=$(echo "$rtt" | grep -o -E '[0-9]+(\.[0-9]+)?')
     local rtt_unit=$(echo "$rtt" | grep -o -E '[a-zA-Z]+')
     local half_rtt=$(echo "scale=2; $rtt_num / 2" | bc)${rtt_unit}
-    echo "$half_rtt"
+    #echo "$half_rtt"
     # bandwidth parsing, currently unused
     local bw_num=$(echo "$bw" | grep -o -e '[0-9]+(\.[0-9]+)?')
     local bw_unit=$(echo "$bw" | grep -o -e '[a-zA-Z]+')
 
     # shaping using htb
-    vm_exec_get $RCV_VM "tc qdisc replace dev ifb0 root handle 1: htb default 10"
-    vm_exec_get $RCV_VM "tc qdisc replace dev $RIFN root handle 1: htb default 10"
-    vm_exec_get $RCV_VM "tc class replace dev ifb0 parent 1: classid 1:1 htb rate $bw"
-    vm_exec_get $RCV_VM "tc class replace dev ifb0 parent 1:1 classid 1:10 htb rate $bw"
-    vm_exec_get $RCV_VM "tc qdisc replace dev ifb0 parent 1:10 handle 10: netem delay $half_rtt"
-    vm_exec_get $RCV_VM "tc class replace dev $RIFN parent 1: classid 1:1 htb rate $bw"
-    vm_exec_get $RCV_VM "tc class replace dev $RIFN parent 1:1 classid 1:10 htb rate $bw"
-    vm_exec_get $RCV_VM "tc qdisc replace dev $RIFN parent 1:10 handle 10: netem delay $half_rtt"
+    #vm_exec_get $RCV_VM "tc qdisc replace dev ifb0 root handle 1: htb default 10"
+    #vm_exec_get $RCV_VM "tc qdisc replace dev $RIFN root handle 1: htb default 10"
+    #vm_exec_get $RCV_VM "tc class replace dev ifb0 parent 1: classid 1:1 htb rate $bw"
+    #vm_exec_get $RCV_VM "tc class replace dev ifb0 parent 1:1 classid 1:10 htb rate $bw"
+    #vm_exec_get $RCV_VM "tc qdisc replace dev ifb0 parent 1:10 handle 10: netem delay $half_rtt"
+    #vm_exec_get $RCV_VM "tc class replace dev $RIFN parent 1: classid 1:1 htb rate $bw"
+    #vm_exec_get $RCV_VM "tc class replace dev $RIFN parent 1:1 classid 1:10 htb rate $bw"
+    #vm_exec_get $RCV_VM "tc qdisc replace dev $RIFN parent 1:10 handle 10: netem delay $half_rtt"
     
-    # keeping tbf here for reference (not yet updated vars)
-    #sudo tc qdisc replace dev ifb0 root handle 1: netem delay $HALF_RTT
-    #sudo tc qdisc replace dev $VIF root handle 1: netem delay $HALF_RTT
-    #sudo tc qdisc replace dev ifb0 parent 1: handle 10: tbf rate $BW burst 32kB latency 50ms
-    #sudo tc qdisc replace dev vnet18 parent 1: handle 10: tbf rate $BW burst 32kB latency 50ms
+    # shaping using tbf
+    vm_exec_get $RCV_VM "tc qdisc replace dev ifb0 root handle 1: netem delay $half_rtt"
+    vm_exec_get $RCV_VM "tc qdisc replace dev $RIFN root handle 1: netem delay $half_rtt"
+    vm_exec_get $RCV_VM "tc qdisc replace dev ifb0 parent 1: handle 10: tbf rate $bw burst 32kB latency 50ms"
+    vm_exec_get $RCV_VM "tc qdisc replace dev $RIFN parent 1: handle 10: tbf rate $bw burst 32kB latency 50ms"
 }
 
 
 start_capture() {
     # doesnt return pid like iperf cuz tcpdump output not needed
-    echo "kylan ass: $SIFN, $TIME"
+    vm_exec_get $SND_VM "killall tcpdump"
+    echo "$SIFN, $TIME"
     local tpid=$(vm_exec $SND_VM "tcpdump -U -i $SIFN -w /tmp/$TIME.pcap")
     vm_exec_output $SND_VM $tpid
     echo $tpid
@@ -151,11 +164,13 @@ stop_capture() {
     # vm_exec_get $RCV_VM "killall tcpdump"
 }
 
-# starts iperf3 sending, RETURNS PID of send VM's iperf
+# starts iperf3 sending (runs indefinitely), RETURNS PID of send VM's iperf
 begin_iperf() {
+    vm_exec_get $SND_VM "killall iperf3"
+    vm_exec_get $RCV_VM "killall iperf3"
     local ipid=$(vm_exec $RCV_VM "iperf3 -s")
     sleep 0.5
-    vm_exec $SND_VM "iperf3 -c 192.168.11.10 -J --logfile=/tmp/iperf3_$TIME.json"
+    vm_exec $SND_VM "iperf3 -c 192.168.11.10 -J -t 0 --logfile=/tmp/iperf3_$TIME.json"
     echo $ipid
 }
 
@@ -170,24 +185,43 @@ finish_iperf() {
 }
 
 ####################
+#mkdir $TIME
 setup_ifb
+setup_router
 tune 5Mbps 50ms
+tune 500Mbps 50ms
 TCD=$(start_capture)
 IPFg=$(begin_iperf)
 echo "tcpdump pid: $TCD"
 echo "iperf pid: $IPFg"
+# if change interval here, remember to change in analyse.py as well
+sleep 5;
+tune 2kbps 50ms;
 sleep 5;
 tune 2Mbps 50ms;
 sleep 5;
-tune 1Mbps 50ms;
-sleep 5;
 tune 500kbps 50ms;
 sleep 5;
-finish_iperf $IPF
-sleep 1;
+finish_iperf;
+sleep 5; # a bit buffer time i guess
 stop_capture
 scp fyp-vm1:/tmp/$TIME.pcap .
 scp fyp-vm1:/tmp/iperf3_$TIME.json .
+vm_exec_get $SND_VM "rm -f /tmp/$TIME.pcap /tmp/iperf3_$TIME.json"
 # output files should be:
 # ./$time.log
 # ./$time.pcap
+
+### pre-analyse ###
+tshark -r $TIME.pcap -T fields \
+  -e frame.time_relative \
+  -e tcp.seq \
+  -e tcp.analysis.ack_rtt \
+  -E header=y \
+  -E separator=, \
+  -E quote=d \
+  -Y "tcp.analysis.ack_rtt" \
+  > rtt_$TIME.csv
+
+echo "RTT analysis done, please run python analyse.py rtt_$TIME.csv iperf3_$TIME.json"
+echo "rtt_$TIME.csv"
