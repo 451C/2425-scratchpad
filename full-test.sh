@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# 
 # this scripts takes qdisc for router as argument
 QDISC="$@"
 # if qdisc null, set as fq_codel
